@@ -96,6 +96,22 @@ public class TermuxShellManager {
         TERMINAL_SESSION_NUMBER_SINCE_APP_START = 0;
     }
 
+    /**
+     * Remove a plugin {@link ExecutionCommand} from the {@link #mPendingPluginExecutionCommands} list.
+     * This is a no-op if the command is {@code null} or not present in the list.
+     *
+     * This method must be called whenever a plugin execution command finishes processing — whether
+     * it succeeded, failed, or was cancelled — so that the pending list does not accumulate stale
+     * entries.  The method is intentionally idempotent: calling it more than once for the same
+     * command is safe.
+     *
+     * @param executionCommand The {@link ExecutionCommand} to remove.
+     */
+    public synchronized void removePendingPluginExecutionCommand(ExecutionCommand executionCommand) {
+        if (executionCommand != null)
+            mPendingPluginExecutionCommands.remove(executionCommand);
+    }
+
     public static synchronized int getNextShellId() {
         return SHELL_ID++;
     }
