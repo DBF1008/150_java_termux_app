@@ -269,7 +269,6 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
 
         List<TermuxSession> termuxSessions = new ArrayList<>(mShellManager.mTermuxSessions);
         List<AppShell> termuxTasks = new ArrayList<>(mShellManager.mTermuxTasks);
-        List<ExecutionCommand> pendingPluginExecutionCommands = new ArrayList<>(mShellManager.mPendingPluginExecutionCommands);
 
         for (int i = 0; i < termuxSessions.size(); i++) {
             ExecutionCommand executionCommand = termuxSessions.get(i).getExecutionCommand();
@@ -288,14 +287,75 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
                 mShellManager.mTermuxTasks.remove(termuxTasks.get(i));
         }
 
+        // Cancel and finalize any commands still pending hand-off, then clear the list. Funneling this
+        // through one place guarantees each pending-result command is processed exactly once and that
+        // the list (which lives in the singleton TermuxShellManager) does not leak or get re-processed
+        // across service stops.
+        cancelAndClearPendingPluginExecutionCommands(
+            mShellManager.mPendingPluginExecutionCommands,
+            this.getString(com.termux.shared.R.string.error_execution_cancelled),
+            executionCommand -> TermuxPluginUtils.processPluginExecutionCommandResult(this, LOG_TAG, executionCommand));
+    }
+
+    /** Functional interface for sending a finalized pending plugin command's result back to its
+     * caller. Abstracted so {@link #cancelAndClearPendingPluginExecutionCommands} can be unit-tested
+     * without a live service or a real {@link PendingIntent}. */
+    interface PendingPluginCommandResultProcessor {
+        void processResult(ExecutionCommand executionCommand);
+    }
+
+    /**
+     * Cancel every plugin {@link ExecutionCommand} in {@code pendingPluginExecutionCommands} that is
+     * still waiting to be handed off to a session/task and expects a result back, then clear the list.
+     *
+     * Each such command is set to the {@link Errno#ERRNO_CANCELLED} failed state and its result is
+     * sent back exactly once; the {@link ExecutionCommand#shouldNotProcessResults()} guard prevents a
+     * command that was already finalized from being processed again. The list is emptied at the end so
+     * that no command lingers in the singleton {@link TermuxShellManager} to be re-processed or leaked
+     * on a later service stop.
+     *
+     * @param pendingPluginExecutionCommands The pending commands list to drain.
+     * @param cancelErrmsg The error message to set on cancelled commands.
+     * @param resultProcessor Sends a finalized command's result back to its caller.
+     */
+    static void cancelAndClearPendingPluginExecutionCommands(@NonNull List<ExecutionCommand> pendingPluginExecutionCommands,
+                                                             @NonNull String cancelErrmsg,
+                                                             @NonNull PendingPluginCommandResultProcessor resultProcessor) {
         for (int i = 0; i < pendingPluginExecutionCommands.size(); i++) {
             ExecutionCommand executionCommand = pendingPluginExecutionCommands.get(i);
-            if (!executionCommand.shouldNotProcessResults() && executionCommand.isPluginExecutionCommandWithPendingResult()) {
-                if (executionCommand.setStateFailed(Errno.ERRNO_CANCELLED.getCode(), this.getString(com.termux.shared.R.string.error_execution_cancelled))) {
-                    TermuxPluginUtils.processPluginExecutionCommandResult(this, LOG_TAG, executionCommand);
-                }
+            // Check for a pending result before shouldNotProcessResults() so the one-shot processing
+            // flag is only consumed for commands we are actually going to finalize here.
+            if (executionCommand.isPluginExecutionCommandWithPendingResult() && !executionCommand.shouldNotProcessResults()) {
+                if (executionCommand.setStateFailed(Errno.ERRNO_CANCELLED.getCode(), cancelErrmsg))
+                    resultProcessor.processResult(executionCommand);
             }
         }
+
+        pendingPluginExecutionCommands.clear();
+    }
+
+    /**
+     * Finalize a plugin {@link ExecutionCommand} that failed before it could be handed off to a
+     * running {@link TermuxSession} or {@link AppShell}: send the error back to the command caller
+     * (so a plugin like Termux:Tasker or a RUN_COMMAND sender is not left waiting forever) and remove
+     * it from {@link TermuxShellManager#mPendingPluginExecutionCommands} so it is finalized exactly
+     * once and does not linger to be processed again when the service is later stopped.
+     *
+     * The {@link ExecutionCommand} must already be in the failed state. The pending list removal is a
+     * no-op for non-plugin (user-initiated) commands that were never added to the list.
+     */
+    private synchronized void finishFailedPluginExecutionCommand(ExecutionCommand executionCommand, boolean forceNotification) {
+        if (executionCommand.isPluginExecutionCommand)
+            TermuxPluginUtils.processPluginExecutionCommandError(this, LOG_TAG, executionCommand, forceNotification);
+
+        mShellManager.mPendingPluginExecutionCommands.remove(executionCommand);
+    }
+
+    /** Set {@code executionCommand} to the {@link Errno#ERRNO_FAILED} failed state with {@code errmsg}
+     * and finalize it via {@link #finishFailedPluginExecutionCommand(ExecutionCommand, boolean)}. */
+    private synchronized void setAndFinishFailedPluginExecutionCommand(ExecutionCommand executionCommand, boolean forceNotification, String errmsg) {
+        executionCommand.setStateFailed(Errno.ERRNO_FAILED.getCode(), errmsg);
+        finishFailedPluginExecutionCommand(executionCommand, forceNotification);
     }
 
 
@@ -419,8 +479,7 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
             executeTermuxSessionCommand(executionCommand);
         else {
             String errmsg = getString(R.string.error_termux_service_unsupported_execution_command_runner, executionCommand.runner);
-            executionCommand.setStateFailed(Errno.ERRNO_FAILED.getCode(), errmsg);
-            TermuxPluginUtils.processPluginExecutionCommandError(this, LOG_TAG, executionCommand, false);
+            setAndFinishFailedPluginExecutionCommand(executionCommand, false, errmsg);
         }
     }
 
@@ -481,9 +540,10 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
             new TermuxShellEnvironment(), null,false);
         if (newTermuxTask == null) {
             Logger.logError(LOG_TAG, "Failed to execute new TermuxTask command for:\n" + executionCommand.getCommandIdAndLabelLogString());
-            // If the execution command was started for a plugin, then process the error
+            // If the execution command was started for a plugin, then process the error and remove it
+            // from the pending list so its caller is notified and it does not linger to be processed again
             if (executionCommand.isPluginExecutionCommand)
-                TermuxPluginUtils.processPluginExecutionCommandError(this, LOG_TAG, executionCommand, false);
+                finishFailedPluginExecutionCommand(executionCommand, false);
             else {
                 Logger.logError(LOG_TAG, "Set log level to debug or higher to see error in logs");
                 Logger.logErrorPrivateExtended(LOG_TAG, executionCommand.toString());
@@ -595,9 +655,10 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
             this, new TermuxShellEnvironment(), null, executionCommand.isPluginExecutionCommand);
         if (newTermuxSession == null) {
             Logger.logError(LOG_TAG, "Failed to execute new TermuxSession command for:\n" + executionCommand.getCommandIdAndLabelLogString());
-            // If the execution command was started for a plugin, then process the error
+            // If the execution command was started for a plugin, then process the error and remove it
+            // from the pending list so its caller is notified and it does not linger to be processed again
             if (executionCommand.isPluginExecutionCommand)
-                TermuxPluginUtils.processPluginExecutionCommandError(this, LOG_TAG, executionCommand, false);
+                finishFailedPluginExecutionCommand(executionCommand, false);
             else {
                 Logger.logError(LOG_TAG, "Set log level to debug or higher to see error in logs");
                 Logger.logErrorPrivateExtended(LOG_TAG, executionCommand.toString());
@@ -667,14 +728,14 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
             return ShellCreateMode.ALWAYS; // Default
         else if (ShellCreateMode.NO_SHELL_WITH_NAME.equalsMode(executionCommand.shellCreateMode))
             if (DataUtils.isNullOrEmpty(executionCommand.shellName)) {
-                TermuxPluginUtils.setAndProcessPluginExecutionCommandError(this, LOG_TAG, executionCommand, false,
+                setAndFinishFailedPluginExecutionCommand(executionCommand, false,
                     getString(R.string.error_termux_service_execution_command_shell_name_unset, executionCommand.shellCreateMode));
                 return null;
             } else {
                return ShellCreateMode.NO_SHELL_WITH_NAME;
             }
         else {
-            TermuxPluginUtils.setAndProcessPluginExecutionCommandError(this, LOG_TAG, executionCommand, false,
+            setAndFinishFailedPluginExecutionCommand(executionCommand, false,
                 getString(R.string.error_termux_service_unsupported_execution_command_shell_create_mode, executionCommand.shellCreateMode));
             return null;
         }
