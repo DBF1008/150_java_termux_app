@@ -298,6 +298,12 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             notifyOfSessionChange();
         }
 
+        // Persist the now-current session immediately so the stored handle always matches the displayed
+        // session. This makes session restoration a single source of truth: a restore on the next
+        // foreground transition (including the one in onStart()) re-selects this same session instead of an
+        // older stored one, which is what previously caused the current session to "drift" after a relaunch.
+        setCurrentStoredSession();
+
         // We call the following even when the session is already being displayed since config may
         // be stale, like current session not selected or scrolled to.
         checkAndScrollToSession(session);
@@ -466,8 +472,18 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         if (termuxSessionsListView == null) return;
 
         termuxSessionsListView.setItemChecked(indexOfSession, true);
-        // Delay is necessary otherwise sometimes scroll to newly added session does not happen
-        termuxSessionsListView.postDelayed(() -> termuxSessionsListView.smoothScrollToPosition(indexOfSession), 1000);
+        // Delay is necessary otherwise sometimes scroll to newly added session does not happen.
+        // Re-resolve the index at fire time from the session that is actually current then, instead of
+        // scrolling to the index captured now: the current session may change within the delay (e.g. a
+        // second setCurrentSession during a relaunch), and scrolling to a stale index is what made the
+        // list highlight/scroll disagree with the displayed terminal.
+        termuxSessionsListView.postDelayed(() -> {
+            TermuxService currentService = mActivity.getTermuxService();
+            if (currentService == null) return;
+            int currentIndexOfSession = currentService.getIndexOfSession(mActivity.getCurrentSession());
+            if (currentIndexOfSession < 0) return;
+            termuxSessionsListView.smoothScrollToPosition(currentIndexOfSession);
+        }, 1000);
     }
 
 

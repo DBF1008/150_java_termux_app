@@ -374,6 +374,22 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         savedInstanceState.putBoolean(ARG_ACTIVITY_RECREATED, true);
     }
 
+    @Override
+    protected void onNewIntent(Intent intent) {
+        Logger.logDebug(LOG_TAG, "onNewIntent");
+
+        super.onNewIntent(intent);
+
+        // Since the activity is launchMode="singleTask", relaunching it (e.g. tapping the launcher
+        // "New session" shortcut) while it is already running delivers the intent here instead of through
+        // a fresh onCreate()/onServiceConnected(). Store it and, if the service is already bound, handle it
+        // now through the same startup funnel; otherwise onServiceConnected() will pick it up via getIntent().
+        setIntent(intent);
+
+        if (mTermuxService != null)
+            handleTermuxActivityIntent(intent, false);
+    }
+
 
 
 
@@ -391,41 +407,14 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
 
         setTermuxSessionsListView();
 
-        final Intent intent = getIntent();
-        setIntent(null);
+        // Handle the intent that (re)started the activity through the single startup funnel. This is the
+        // initial launch intent, so a "New session" intent re-delivered after an activity recreate is
+        // treated as a stale re-delivery and does not spawn a duplicate session.
+        handleTermuxActivityIntent(getIntent(), true);
 
-        if (mTermuxService.isTermuxSessionsEmpty()) {
-            if (mIsVisible) {
-                TermuxInstaller.setupBootstrapIfNeeded(TermuxActivity.this, () -> {
-                    if (mTermuxService == null) return; // Activity might have been destroyed.
-                    try {
-                        boolean launchFailsafe = false;
-                        if (intent != null && intent.getExtras() != null) {
-                            launchFailsafe = intent.getExtras().getBoolean(TERMUX_ACTIVITY.EXTRA_FAILSAFE_SESSION, false);
-                        }
-                        mTermuxTerminalSessionActivityClient.addNewSession(launchFailsafe, null);
-                    } catch (WindowManager.BadTokenException e) {
-                        // Activity finished - ignore.
-                    }
-                });
-            } else {
-                // The service connected while not in foreground - just bail out.
-                finishActivityIfNotFinishing();
-            }
-        } else {
-            // If termux was started from launcher "New session" shortcut and activity is recreated,
-            // then the original intent will be re-delivered, resulting in a new session being re-added
-            // each time.
-            if (!mIsActivityRecreated && intent != null && Intent.ACTION_RUN.equals(intent.getAction())) {
-                // Android 7.1 app shortcut from res/xml/shortcuts.xml.
-                boolean isFailSafe = intent.getBooleanExtra(TERMUX_ACTIVITY.EXTRA_FAILSAFE_SESSION, false);
-                mTermuxTerminalSessionActivityClient.addNewSession(isFailSafe, null);
-            } else {
-                mTermuxTerminalSessionActivityClient.setCurrentSession(mTermuxTerminalSessionActivityClient.getCurrentStoredSessionOrLast());
-            }
-        }
-
-        // Update the {@link TerminalSession} and {@link TerminalEmulator} clients.
+        // Update the {@link TerminalSession} and {@link TerminalEmulator} clients. This must run after
+        // handleTermuxActivityIntent() so that a session created during a cold start is rewired from the
+        // service session client to this activity session client.
         mTermuxService.setTermuxTerminalSessionClient(mTermuxTerminalSessionActivityClient);
     }
 
@@ -435,6 +424,61 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
 
         // Respect being stopped from the {@link TermuxService} notification action.
         finishActivityIfNotFinishing();
+    }
+
+    /**
+     * Single funnel for handling the intent that (re)started or was delivered to {@link TermuxActivity}.
+     * It decides, via {@link TermuxActivitySessionStartup}, whether to create a new session, restore the
+     * current one, bootstrap and create the first one, or finish the activity. This consolidates logic that
+     * previously lived inline in {@link #onServiceConnected} and avoids the duplicate-session / current-session
+     * drift that happened when the launch intent was re-delivered or handled from more than one place.
+     *
+     * @param intent                the intent to handle (may be null).
+     * @param isInitialLaunchIntent true if this is the initial launch intent obtained at service-connect
+     *                              time; false if it was freshly delivered via {@link #onNewIntent}.
+     */
+    private void handleTermuxActivityIntent(Intent intent, boolean isInitialLaunchIntent) {
+        if (mTermuxService == null) return;
+
+        boolean hasSessions = !mTermuxService.isTermuxSessionsEmpty();
+        boolean intentRequestsNewSession = intent != null && Intent.ACTION_RUN.equals(intent.getAction());
+        boolean isFailsafe = intent != null && intent.getBooleanExtra(TERMUX_ACTIVITY.EXTRA_FAILSAFE_SESSION, false);
+
+        // A "New session" intent re-delivered after an activity recreate must not spawn another session.
+        // This only applies to the initial launch intent; an intent freshly delivered via onNewIntent() is a
+        // genuine user action and is never treated as stale (mIsActivityRecreated can stay true for the life
+        // of a recreated instance, so it must not be allowed to permanently disable the shortcut).
+        boolean treatNewSessionIntentAsStale = isInitialLaunchIntent && mIsActivityRecreated;
+        boolean activityIsVisible = TermuxActivitySessionStartup.treatActivityAsVisible(mIsVisible, isInitialLaunchIntent);
+
+        // Consume the intent so a later service reconnect (which re-runs onServiceConnected) does not
+        // re-process it and create a duplicate session.
+        setIntent(null);
+
+        switch (TermuxActivitySessionStartup.determineStartupAction(
+                hasSessions, activityIsVisible, treatNewSessionIntentAsStale, intentRequestsNewSession)) {
+            case BOOTSTRAP_AND_CREATE_SESSION:
+                TermuxInstaller.setupBootstrapIfNeeded(TermuxActivity.this, () -> {
+                    if (mTermuxService == null) return; // Activity might have been destroyed.
+                    try {
+                        mTermuxTerminalSessionActivityClient.addNewSession(isFailsafe, null);
+                    } catch (WindowManager.BadTokenException e) {
+                        // Activity finished - ignore.
+                    }
+                });
+                break;
+            case FINISH_ACTIVITY:
+                // The service connected while not in foreground and there is nothing to show - just bail out.
+                finishActivityIfNotFinishing();
+                break;
+            case CREATE_NEW_SESSION:
+                // e.g. Android 7.1 app shortcut from res/xml/shortcuts.xml.
+                mTermuxTerminalSessionActivityClient.addNewSession(isFailsafe, null);
+                break;
+            case RESTORE_SESSION:
+                mTermuxTerminalSessionActivityClient.setCurrentSession(mTermuxTerminalSessionActivityClient.getCurrentStoredSessionOrLast());
+                break;
+        }
     }
 
 
