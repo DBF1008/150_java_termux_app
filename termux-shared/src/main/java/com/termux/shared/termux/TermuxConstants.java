@@ -652,6 +652,14 @@ public final class TermuxConstants {
     public static final File TERMUX_STAGING_PREFIX_DIR = new File(TERMUX_STAGING_PREFIX_DIR_PATH);
 
 
+    /** Termux app bootstrap installed marker file path.
+     *  This file is created as the LAST step of a successful bootstrap installation.
+     *  Its presence indicates that the prefix directory was fully installed.
+     *  Its absence with a non-empty prefix indicates a partial/corrupt install. */
+    public static final String TERMUX_BOOTSTRAP_INSTALLED_MARKER_FILE_PATH = TERMUX_PREFIX_DIR_PATH + "/.bootstrap-installed"; // Default: "/data/data/com.termux/files/usr/.bootstrap-installed"
+    /** Termux app bootstrap installed marker file */
+    public static final File TERMUX_BOOTSTRAP_INSTALLED_MARKER_FILE = new File(TERMUX_BOOTSTRAP_INSTALLED_MARKER_FILE_PATH);
+
 
     /** Termux app $HOME directory path */
     public static final String TERMUX_HOME_DIR_PATH = TERMUX_FILES_DIR_PATH + "/home"; // Default: "/data/data/com.termux/files/home"

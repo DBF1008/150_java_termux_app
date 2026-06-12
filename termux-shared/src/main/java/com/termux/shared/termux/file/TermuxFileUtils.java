@@ -343,6 +343,20 @@ public class TermuxFileUtils {
     }
 
     /**
+     * Check if the termux prefix directory appears to be a valid complete installation.
+     * A valid installation has a non-empty prefix directory AND the bootstrap marker file.
+     *
+     * @return {@code true} if the prefix appears to be a complete valid installation.
+     */
+    public static boolean isTermuxPrefixDirectoryValid() {
+        if (!FileUtils.directoryFileExists(TERMUX_PREFIX_DIR_PATH, true))
+            return false;
+        if (!FileUtils.regularFileExists(TermuxConstants.TERMUX_BOOTSTRAP_INSTALLED_MARKER_FILE_PATH, false))
+            return false;
+        return !isTermuxPrefixDirectoryEmpty();
+    }
+
+    /**
      * Get a markdown {@link String} for stat output for various Termux app files paths.
      *
      * @param context The context for operations.
