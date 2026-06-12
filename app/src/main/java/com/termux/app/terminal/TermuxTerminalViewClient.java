@@ -131,6 +131,17 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
     public void onStop() {
         // Stop terminal cursor blinking if enabled
         setTerminalCursorBlinkerState(false);
+
+        // Reset virtual modifier keys to prevent them being stuck if key-up was lost
+        // while app was backgrounding (e.g., user held volume key during task switch)
+        mVirtualControlKeyDown = false;
+        mVirtualFnKeyDown = false;
+
+        // Reset extra keys special button states including locked ones, since key-up
+        // events may have been lost while backgrounding
+        if (mActivity.getExtraKeysView() != null) {
+            mActivity.getExtraKeysView().resetSpecialButtons(true);
+        }
     }
 
     /**
@@ -308,6 +319,11 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
         } else if (inputDevice != null && inputDevice.getKeyboardType() == InputDevice.KEYBOARD_TYPE_ALPHABETIC) {
             // Do not steal dedicated buttons from a full external keyboard.
             return false;
+        } else if (mActivity.isTerminalToolbarTextInputViewSelected()) {
+            // Do not intercept volume keys as modifiers when toolbar text input page
+            // is active, since the user is typing into the text input field and
+            // volume keys should retain their normal system volume behavior.
+            return false;
         } else if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
             mVirtualControlKeyDown = down;
             return true;
@@ -337,6 +353,12 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
 
     @Override
     public boolean readFnKey() {
+        // Note: Unlike readControlKey(), this intentionally does NOT include
+        // mVirtualFnKeyDown. Virtual Fn key mapping is handled separately in
+        // onCodePoint() where mVirtualFnKeyDown triggers character remapping
+        // (e.g., 'w' → UP arrow). Including it here would cause double-processing
+        // since TerminalView.onKeyDown() uses readFnKey() for key event encoding,
+        // while onCodePoint() handles the virtual Fn character transformation.
         return readExtraKeysSpecialButton(SpecialButton.FN);
     }
 
@@ -547,8 +569,10 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
                     mShowSoftKeyboardWithDelayOnce = false;
                     mActivity.getTerminalView().postDelayed(getShowSoftKeyboardRunnable(), 500);
                     mActivity.getTerminalView().requestFocus();
-                } else
+                } else {
+                    mActivity.getTerminalView().requestFocus();
                     KeyboardUtils.showSoftKeyboard(mActivity, mActivity.getTerminalView());
+                }
             }
         }
         // If soft keyboard toggle behaviour is show/hide
@@ -623,8 +647,13 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
                         mShowSoftKeyboardIgnoreOnce = false; return;
                     }
                     Logger.logVerbose(LOG_TAG, "Showing soft keyboard on focus change");
+                    // Resume cursor blinker when terminal regains focus
+                    if (hasFocus && mActivity.isVisible())
+                        setTerminalCursorBlinkerState(true);
                 } else {
                     Logger.logVerbose(LOG_TAG, "Hiding soft keyboard on focus change");
+                    // Pause cursor blinker when terminal loses focus
+                    setTerminalCursorBlinkerState(false);
                 }
 
                 KeyboardUtils.setSoftKeyboardVisibility(getShowSoftKeyboardRunnable(), mActivity, mActivity.getTerminalView(), hasFocus || textInputViewHasFocus);

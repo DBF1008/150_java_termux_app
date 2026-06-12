@@ -106,6 +106,10 @@ public class TerminalToolbarViewPager {
         public void onPageSelected(int position) {
             if (position == 0) {
                 mActivity.getTerminalView().requestFocus();
+                // Reset non-locked modifier states when switching back to extra keys page.
+                // Locked modifiers (long-press) are preserved per user intent.
+                if (mActivity.getExtraKeysView() != null)
+                    mActivity.getExtraKeysView().resetSpecialButtons(false);
             } else {
                 final EditText editText = mTerminalToolbarViewPager.findViewById(R.id.terminal_toolbar_text_input);
                 if (editText != null) editText.requestFocus();

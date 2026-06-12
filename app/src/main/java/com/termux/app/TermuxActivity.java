@@ -548,6 +548,11 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         if (showNow && isTerminalToolbarTextInputViewSelected()) {
             // Focus the text input view if just revealed.
             findViewById(R.id.terminal_toolbar_text_input).requestFocus();
+        } else if (!showNow) {
+            // Always restore focus to terminal when hiding toolbar, since the text
+            // input view or extra keys may have had focus and losing it would orphan
+            // keyboard input and leave the soft keyboard targeting the wrong view.
+            mTerminalView.requestFocus();
         }
     }
 

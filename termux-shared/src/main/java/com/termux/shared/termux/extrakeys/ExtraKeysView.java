@@ -654,6 +654,25 @@ public final class ExtraKeysView extends GridLayout {
         return true;
     }
 
+    /**
+     * Reset special button states.
+     *
+     * @param clearLocked If {@code true}, also clear locked states (for lifecycle events like
+     *                    onStop/onResume after background where key-up events may have been lost).
+     *                    If {@code false}, only clear non-locked active states (for page switches
+     *                    where user's long-press lock intent should be respected).
+     */
+    public void resetSpecialButtons(boolean clearLocked) {
+        for (SpecialButtonState state : mSpecialButtons.values()) {
+            if (clearLocked) {
+                state.setIsLocked(false);
+                state.setIsActive(false);
+            } else if (!state.isLocked) {
+                state.setIsActive(false);
+            }
+        }
+    }
+
     public MaterialButton createSpecialButton(String buttonKey, boolean needUpdate) {
         SpecialButtonState state = mSpecialButtons.get(SpecialButton.valueOf(buttonKey));
         if (state == null) return null;
