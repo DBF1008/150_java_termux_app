@@ -323,6 +323,18 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
     }
 
     @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+
+        // When the window loses focus (notification shade pull, dialog, app switch, recents, etc.),
+        // Android may never deliver the ACTION_UP for a held volume button used as a virtual Ctrl/Fn
+        // key, or other transient modifier, leaving it "stuck" when we return. Reset all transient
+        // input state here so foreground/background behaviour stays consistent.
+        if (!hasFocus && mTermuxTerminalViewClient != null)
+            mTermuxTerminalViewClient.resetInputState();
+    }
+
+    @Override
     protected void onStop() {
         super.onStop();
 
@@ -548,7 +560,18 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         if (showNow && isTerminalToolbarTextInputViewSelected()) {
             // Focus the text input view if just revealed.
             findViewById(R.id.terminal_toolbar_text_input).requestFocus();
+        } else {
+            // Toolbar hidden (or showing the extra-keys page): return focus to the terminal so input
+            // and the cursor blinker go back to the terminal view instead of being left on a now
+            // hidden text input EditText.
+            mTerminalView.requestFocus();
         }
+
+        // Re-assert the cursor blinker after the toggle. Requesting focus above only restarts the
+        // blinker (via the terminal view focus listener) when focus actually changes, so this covers
+        // the case where the terminal already had focus.
+        if (mTermuxTerminalViewClient != null)
+            mTermuxTerminalViewClient.setTerminalCursorBlinkerState(true);
     }
 
     private void saveTerminalToolbarTextInput(Bundle savedInstanceState) {

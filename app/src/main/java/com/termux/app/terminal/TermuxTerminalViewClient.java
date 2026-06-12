@@ -25,6 +25,7 @@ import com.termux.shared.interact.ShareUtils;
 import com.termux.shared.shell.ShellUtils;
 import com.termux.shared.termux.TermuxBootstrap;
 import com.termux.shared.termux.terminal.TermuxTerminalViewClientBase;
+import com.termux.shared.termux.extrakeys.ExtraKeysView;
 import com.termux.shared.termux.extrakeys.SpecialButton;
 import com.termux.shared.android.AndroidUtils;
 import com.termux.shared.termux.TermuxConstants;
@@ -32,6 +33,7 @@ import com.termux.shared.activities.ReportActivity;
 import com.termux.shared.models.ReportInfo;
 import com.termux.app.models.UserAction;
 import com.termux.app.terminal.io.KeyboardShortcut;
+import com.termux.app.terminal.io.VirtualKeysState;
 import com.termux.shared.termux.settings.properties.TermuxPropertyConstants;
 import com.termux.shared.data.DataUtils;
 import com.termux.shared.logger.Logger;
@@ -59,8 +61,11 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
 
     final TermuxTerminalSessionActivityClient mTermuxTerminalSessionActivityClient;
 
-    /** Keeping track of the special keys acting as Ctrl and Fn for the soft keyboard and other hardware keys. */
-    boolean mVirtualControlKeyDown, mVirtualFnKeyDown;
+    /** Single owner of the virtual modifier-key state emulated by the dedicated volume buttons
+     * (volume-down = Ctrl, volume-up = Fn) for the soft keyboard and other non-full keyboards.
+     * Reset on foreground/background transitions via {@link #resetInputState()} so a key held during
+     * a window focus change cannot remain stuck on return. */
+    private final VirtualKeysState mVirtualKeysState = new VirtualKeysState();
 
     private Runnable mShowSoftKeyboardRunnable;
 
@@ -131,6 +136,12 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
     public void onStop() {
         // Stop terminal cursor blinking if enabled
         setTerminalCursorBlinkerState(false);
+
+        // Backstop reset of transient input state so virtual modifiers and non-locked extra keys
+        // can never leak across a background/foreground transition. The primary trigger is
+        // TermuxActivity.onWindowFocusChanged(), which fires earlier (e.g. on a notification shade
+        // pull) where a held volume key's ACTION_UP would otherwise be lost. See resetInputState().
+        resetInputState();
     }
 
     /**
@@ -308,21 +319,15 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
         } else if (inputDevice != null && inputDevice.getKeyboardType() == InputDevice.KEYBOARD_TYPE_ALPHABETIC) {
             // Do not steal dedicated buttons from a full external keyboard.
             return false;
-        } else if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
-            mVirtualControlKeyDown = down;
-            return true;
-        } else if (keyCode == KeyEvent.KEYCODE_VOLUME_UP) {
-            mVirtualFnKeyDown = down;
-            return true;
         }
-        return false;
+        return mVirtualKeysState.handleVirtualModifierKey(keyCode, down);
     }
 
 
 
     @Override
     public boolean readControlKey() {
-        return readExtraKeysSpecialButton(SpecialButton.CTRL) || mVirtualControlKeyDown;
+        return readExtraKeysSpecialButton(SpecialButton.CTRL) || mVirtualKeysState.isVirtualControlKeyDown();
     }
 
     @Override
@@ -350,6 +355,24 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
         return state;
     }
 
+    /**
+     * Reset all transient input state so it cannot leak across activity foreground/background
+     * transitions. This is the single consolidation point for the otherwise-separate input
+     * subsystems: it clears the volume-key virtual modifiers ({@link VirtualKeysState}) and the
+     * non-locked (single-tap) extra-keys special button highlights, while preserving any explicitly
+     * long-press LOCKED extra-keys modifiers.
+     *
+     * Called from {@link TermuxActivity#onWindowFocusChanged(boolean)} when window focus is lost
+     * (the case where a held volume key's ACTION_UP is never delivered, leaving Ctrl/Fn stuck) and
+     * as a backstop from {@link #onStop()}.
+     */
+    public void resetInputState() {
+        mVirtualKeysState.reset();
+        ExtraKeysView extraKeysView = mActivity.getExtraKeysView();
+        if (extraKeysView != null)
+            extraKeysView.unsetSpecialButtonsActiveStates();
+    }
+
     @Override
     public boolean onLongPress(MotionEvent event) {
         return false;
@@ -359,7 +382,7 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
 
     @Override
     public boolean onCodePoint(final int codePoint, boolean ctrlDown, TerminalSession session) {
-        if (mVirtualFnKeyDown) {
+        if (mVirtualKeysState.isVirtualFnKeyDown()) {
             int resultingKeyCode = -1;
             int resultingCodePoint = -1;
             boolean altDown = false;
@@ -448,7 +471,7 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
                 case 'q':
                 case 'k':
                     mActivity.toggleTerminalToolbar();
-                    mVirtualFnKeyDown=false; // force disable fn key down to restore keyboard input into terminal view, fixes termux/termux-app#1420
+                    mVirtualKeysState.setVirtualFnKeyDown(false); // force disable fn key down to restore keyboard input into terminal view, fixes termux/termux-app#1420
                     break;
             }
 
@@ -612,6 +635,11 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
         mActivity.getTerminalView().setOnFocusChangeListener(new View.OnFocusChangeListener() {
             @Override
             public void onFocusChange(View view, boolean hasFocus) {
+                // Keep the terminal cursor blinker in sync with terminal focus so toggling the
+                // toolbar or switching to the toolbar text-input view does not leave the cursor
+                // frozen or blinking in the wrong place: terminal focused -> blink, otherwise stop.
+                setTerminalCursorBlinkerState(hasFocus);
+
                 // Force show soft keyboard if TerminalView or toolbar text input view has
                 // focus and close it if they don't
                 boolean textInputViewHasFocus = false;

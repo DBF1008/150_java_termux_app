@@ -654,6 +654,20 @@ public final class ExtraKeysView extends GridLayout {
         return true;
     }
 
+    /**
+     * Clear the active (highlighted) state of all non-locked special buttons. Buttons that have been
+     * explicitly locked via a long press are preserved. This keeps the extra-keys modifier state
+     * consistent across activity foreground/background transitions, alongside the volume-key virtual
+     * modifiers. Must be called on the UI thread since it updates button colors.
+     */
+    public void unsetSpecialButtonsActiveStates() {
+        if (mSpecialButtons == null) return;
+        for (SpecialButtonState state : mSpecialButtons.values()) {
+            if (state.isCreated && state.isActive && !state.isLocked)
+                state.setIsActive(false);
+        }
+    }
+
     public MaterialButton createSpecialButton(String buttonKey, boolean needUpdate) {
         SpecialButtonState state = mSpecialButtons.get(SpecialButton.valueOf(buttonKey));
         if (state == null) return null;
