@@ -30,6 +30,13 @@ import java.util.LinkedList;
  * support both of them simultaneously, your app will appear twice in the system picker UI,
  * offering two different ways of accessing your stored data. This would be confusing for users."
  * - http://developer.android.com/guide/topics/providers/document-provider.html#43
+ * <p/>
+ * All access is confined to {@link #BASE_DIR}: every document id supplied by a caller is
+ * resolved through {@link TermuxDocumentPaths#resolveFileForDocId} (via {@link #getFileForDocId}),
+ * which rejects ids that do not exist or whose canonical path escapes the base directory. Note
+ * that {@code renameDocument}/{@code copyDocument}/{@code moveDocument} are not overridden and
+ * their {@code FLAG_SUPPORTS_*} bits are not advertised, so the framework never calls them; if
+ * such support is ever added it must resolve its ids through the same chokepoint.
  */
 public class TermuxDocumentsProvider extends DocumentsProvider {
 
@@ -90,8 +97,15 @@ public class TermuxDocumentsProvider extends DocumentsProvider {
     public Cursor queryChildDocuments(String parentDocumentId, String[] projection, String sortOrder) throws FileNotFoundException {
         final MatrixCursor result = new MatrixCursor(projection != null ? projection : DEFAULT_DOCUMENT_PROJECTION);
         final File parent = getFileForDocId(parentDocumentId);
-        for (File file : parent.listFiles()) {
-            includeFile(result, null, file);
+        final File[] children = parent.listFiles();
+        if (children != null) {
+            for (File file : children) {
+                // Only expose entries whose canonical path stays within $HOME, so a symlink
+                // pointing outside is hidden here exactly as it is in search.
+                if (TermuxDocumentPaths.isInScope(file, BASE_DIR)) {
+                    includeFile(result, null, file);
+                }
+            }
         }
         return result;
     }
@@ -117,10 +131,16 @@ public class TermuxDocumentsProvider extends DocumentsProvider {
 
     @Override
     public String createDocument(String parentDocumentId, String mimeType, String displayName) throws FileNotFoundException {
-        File newFile = new File(parentDocumentId, displayName);
+        final File parent = getFileForDocId(parentDocumentId);
+        final String name = TermuxDocumentPaths.sanitizeDisplayName(displayName);
+        File newFile = new File(parent, name);
+        // Defence in depth: even with a sanitized name, never create outside $HOME.
+        if (!TermuxDocumentPaths.isInScope(newFile, BASE_DIR)) {
+            throw new FileNotFoundException("Cannot create document outside allowed storage");
+        }
         int noConflictId = 2;
         while (newFile.exists()) {
-            newFile = new File(parentDocumentId, displayName + " (" + noConflictId++ + ")");
+            newFile = new File(parent, name + " (" + noConflictId++ + ")");
         }
         try {
             boolean succeeded;
@@ -130,18 +150,20 @@ public class TermuxDocumentsProvider extends DocumentsProvider {
                 succeeded = newFile.createNewFile();
             }
             if (!succeeded) {
-                throw new FileNotFoundException("Failed to create document with id " + newFile.getPath());
+                throw new FileNotFoundException("Failed to create document with name " + newFile.getName());
             }
         } catch (IOException e) {
-            throw new FileNotFoundException("Failed to create document with id " + newFile.getPath());
+            throw new FileNotFoundException("Failed to create document with name " + newFile.getName());
         }
-        return newFile.getPath();
+        return getDocIdForFile(newFile);
     }
 
     @Override
     public void deleteDocument(String documentId) throws FileNotFoundException {
-        File file = getFileForDocId(documentId);
-        if (!file.delete()) {
+        final File file = getFileForDocId(documentId);
+        // Recursively remove directories (plain File#delete fails on a non-empty dir) without
+        // following symlinks, so nothing outside $HOME is ever touched.
+        if (!TermuxDocumentPaths.deleteRecursively(file)) {
             throw new FileNotFoundException("Failed to delete document with id " + documentId);
         }
     }
@@ -156,33 +178,28 @@ public class TermuxDocumentsProvider extends DocumentsProvider {
     public Cursor querySearchDocuments(String rootId, String query, String[] projection) throws FileNotFoundException {
         final MatrixCursor result = new MatrixCursor(projection != null ? projection : DEFAULT_DOCUMENT_PROJECTION);
         final File parent = getFileForDocId(rootId);
+        final String matchQuery = query.toLowerCase();
 
-        // This example implementation searches file names for the query and doesn't rank search
-        // results, so we can stop as soon as we find a sufficient number of matches.  Other
-        // implementations might rank results and use other data about files, rather than the file
-        // name, to produce a match.
+        // Search file names for the query without ranking, stopping once enough matches are
+        // found. Other implementations might rank results or match on data other than the name.
         final LinkedList<File> pending = new LinkedList<>();
         pending.add(parent);
 
         final int MAX_SEARCH_RESULTS = 50;
         while (!pending.isEmpty() && result.getCount() < MAX_SEARCH_RESULTS) {
             final File file = pending.removeFirst();
-            // Avoid directories outside the $HOME directory linked with symlinks (to avoid e.g. search
-            // through the whole SD card).
-            boolean isInsideHome;
-            try {
-                isInsideHome = file.getCanonicalPath().startsWith(TermuxConstants.TERMUX_HOME_DIR_PATH);
-            } catch (IOException e) {
-                isInsideHome = true;
+            // Skip anything whose canonical path escapes $HOME (e.g. a symlink to the SD card).
+            // Fails closed: entries that cannot be resolved are skipped rather than searched.
+            if (!TermuxDocumentPaths.isInScope(file, BASE_DIR)) {
+                continue;
             }
-            if (isInsideHome) {
-                if (file.isDirectory()) {
-                    Collections.addAll(pending, file.listFiles());
-                } else {
-                    if (file.getName().toLowerCase().contains(query)) {
-                        includeFile(result, null, file);
-                    }
+            if (file.isDirectory()) {
+                final File[] children = file.listFiles();
+                if (children != null) {
+                    Collections.addAll(pending, children);
                 }
+            } else if (file.getName().toLowerCase().contains(matchQuery)) {
+                includeFile(result, null, file);
             }
         }
 
@@ -191,26 +208,26 @@ public class TermuxDocumentsProvider extends DocumentsProvider {
 
     @Override
     public boolean isChildDocument(String parentDocumentId, String documentId) {
-        return documentId.startsWith(parentDocumentId);
+        return TermuxDocumentPaths.isChildDocument(parentDocumentId, documentId);
     }
 
     /**
      * Get the document id given a file. This document id must be consistent across time as other
      * applications may save the ID and use it to reference documents later.
      * <p/>
-     * The reverse of @{link #getFileForDocId}.
+     * The reverse of {@link #getFileForDocId(String)}.
      */
     private static String getDocIdForFile(File file) {
-        return file.getAbsolutePath();
+        return TermuxDocumentPaths.getDocIdForFile(file);
     }
 
     /**
-     * Get the file given a document id (the reverse of {@link #getDocIdForFile(File)}).
+     * Get the file for a document id, confirming it exists and stays within {@link #BASE_DIR}
+     * (the reverse of {@link #getDocIdForFile(File)}). This is the single point through which
+     * every caller-supplied id is validated before use.
      */
     private static File getFileForDocId(String docId) throws FileNotFoundException {
-        final File f = new File(docId);
-        if (!f.exists()) throw new FileNotFoundException(f.getAbsolutePath() + " not found");
-        return f;
+        return TermuxDocumentPaths.resolveFileForDocId(docId, BASE_DIR);
     }
 
     private static String getMimeType(File file) {
@@ -249,7 +266,8 @@ public class TermuxDocumentsProvider extends DocumentsProvider {
         } else if (file.canWrite()) {
             flags |= Document.FLAG_SUPPORTS_WRITE;
         }
-        if (file.getParentFile().canWrite()) flags |= Document.FLAG_SUPPORTS_DELETE;
+        final File parentFile = file.getParentFile();
+        if (parentFile != null && parentFile.canWrite()) flags |= Document.FLAG_SUPPORTS_DELETE;
 
         final String displayName = file.getName();
         final String mimeType = getMimeType(file);
